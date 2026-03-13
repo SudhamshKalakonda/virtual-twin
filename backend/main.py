@@ -5,9 +5,15 @@ from sqlalchemy.orm import Session
 from embeddings import find_similar_messages, build_embeddings
 from database import get_db, User
 from auth import hash_password, verify_password, create_token, decode_token, generate_user_id
-import ollama as ol
+from groq import Groq
+from dotenv import load_dotenv
 import json
 import os
+import re
+
+load_dotenv()
+
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 app = FastAPI()
 
@@ -40,19 +46,18 @@ def root():
 
 @app.post("/signup")
 def signup(request: SignupRequest, db: Session = Depends(get_db)):
-    # Check if email already exists
     existing = db.query(User).filter(User.email == request.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
     user = User(
-    id=generate_user_id(),
-    name=request.name,
-    whatsapp_name=request.whatsapp_name,
-    partner_name=request.partner_name,
-    email=request.email,
-    password=hash_password(request.password)
-)
+        id=generate_user_id(),
+        name=request.name,
+        whatsapp_name=request.whatsapp_name,
+        partner_name=request.partner_name,
+        email=request.email,
+        password=hash_password(request.password)
+    )
 
     db.add(user)
     db.commit()
@@ -82,13 +87,10 @@ async def upload_messages(
     content = await file.read()
     text = content.decode('utf-8')
 
-    # Parse WhatsApp .txt file
-    import re
     pattern = re.compile(
         r'\[(\d{1,2}/\d{1,2}/\d{2,4}),\s*(\d{1,2}:\d{2}:\d{2}[\s\u202f][AP]M)\]\s(.+?):\s(.+)'
     )
 
-    # Get user's name to extract their messages only
     user = db.query(User).filter(User.id == user_id).first()
 
     messages = []
@@ -111,13 +113,11 @@ async def upload_messages(
     if not messages:
         raise HTTPException(status_code=400, detail="No messages found. Make sure your name matches exactly.")
 
-    # Save parsed messages
     parsed = {'user': user.name, 'total_messages': len(messages), 'messages': messages}
     file_path = f"{UPLOAD_DIR}/{user_id}.json"
     with open(file_path, 'w', encoding='utf-8') as f:
         json.dump(parsed, f, ensure_ascii=False, indent=2)
 
-    # Build embeddings
     build_embeddings(file_path, user_id)
 
     return {
@@ -145,7 +145,6 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # RAG - find most relevant messages for this user
     examples = find_similar_messages(request.message, user_id=user_id, n=20)
     examples_text = "\n".join(examples)
 
@@ -169,5 +168,10 @@ STRICT RULES:
         messages.append({'role': msg.role, 'content': msg.content})
     messages.append({'role': 'user', 'content': request.message})
 
-    response = ol.chat(model='llama3.2', messages=messages)
-    return {"reply": response['message']['content']}
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=messages,
+        max_tokens=150
+    )
+
+    return {"reply": response.choices[0].message.content}
