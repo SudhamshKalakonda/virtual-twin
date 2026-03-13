@@ -7,26 +7,25 @@ model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # Initialize ChromaDB
 client = chromadb.PersistentClient(path="../vectordb")
-collection = client.get_or_create_collection(name="messages")
 
-def build_embeddings(messages_path: str):
-    # Load your parsed messages
+def get_collection(user_id: str):
+    # Each user gets their own collection
+    return client.get_or_create_collection(name=f"messages_{user_id}")
+
+def build_embeddings(messages_path: str, user_id: str):
     with open(messages_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     
     messages = data['messages']
+    collection = get_collection(user_id)
     
     print(f"Building embeddings for {len(messages)} messages...")
     
-    # Process in batches of 500
     batch_size = 500
     for i in range(0, len(messages), batch_size):
         batch = messages[i:i + batch_size]
-        
         texts = [msg['message'] for msg in batch]
         ids = [str(i + j) for j in range(len(batch))]
-        
-        # Convert messages to vectors
         embeddings = model.encode(texts).tolist()
         
         collection.add(
@@ -37,13 +36,12 @@ def build_embeddings(messages_path: str):
         
         print(f"Processed {min(i + batch_size, len(messages))}/{len(messages)}")
     
-    print("Done")
+    print("Done! ✅")
 
-def find_similar_messages(query: str, n: int = 20):
-    # Convert the query to a vector
+def find_similar_messages(query: str, user_id: str, n: int = 20):
+    collection = get_collection(user_id)
     query_embedding = model.encode(query).tolist()
     
-    # Find the most similar messages
     results = collection.query(
         query_embeddings=[query_embedding],
         n_results=n

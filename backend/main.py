@@ -1,7 +1,10 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from embeddings import find_similar_messages
+from sqlalchemy.orm import Session
+from embeddings import find_similar_messages, build_embeddings
+from database import get_db, User
+from auth import hash_password, verify_password, create_token, decode_token, generate_user_id
 import ollama as ol
 import json
 import os
@@ -18,66 +21,153 @@ app.add_middleware(
 UPLOAD_DIR = "../uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# ─── Auth Models ───────────────────────────────────────────
+class SignupRequest(BaseModel):
+    name: str
+    whatsapp_name: str
+    partner_name: str
+    email: str
+    password: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+# ─── Routes ────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"message": "Virtual Twin API is running 🔥"}
 
+@app.post("/signup")
+def signup(request: SignupRequest, db: Session = Depends(get_db)):
+    # Check if email already exists
+    existing = db.query(User).filter(User.email == request.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    user = User(
+    id=generate_user_id(),
+    name=request.name,
+    whatsapp_name=request.whatsapp_name,
+    partner_name=request.partner_name,
+    email=request.email,
+    password=hash_password(request.password)
+)
+
+    db.add(user)
+    db.commit()
+
+    token = create_token(user.id)
+    return {"token": token, "name": user.name, "partner_name": user.partner_name}
+
+@app.post("/login")
+def login(request: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == request.email).first()
+    if not user or not verify_password(request.password, user.password):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    token = create_token(user.id)
+    return {"token": token, "name": user.name, "partner_name": user.partner_name}
+
 @app.post("/upload")
-async def upload_messages(file: UploadFile = File(...)):
+async def upload_messages(
+    file: UploadFile = File(...),
+    token: str = "",
+    db: Session = Depends(get_db)
+):
+    user_id = decode_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
     content = await file.read()
-    messages = json.loads(content)
-    file_path = f"{UPLOAD_DIR}/{file.filename}"
+    text = content.decode('utf-8')
+
+    # Parse WhatsApp .txt file
+    import re
+    pattern = re.compile(
+        r'\[(\d{1,2}/\d{1,2}/\d{2,4}),\s*(\d{1,2}:\d{2}:\d{2}[\s\u202f][AP]M)\]\s(.+?):\s(.+)'
+    )
+
+    # Get user's name to extract their messages only
+    user = db.query(User).filter(User.id == user_id).first()
+
+    messages = []
+    for line in text.split('\n'):
+        match = pattern.match(line)
+        if not match:
+            continue
+        date, time, sender, message = match.groups()
+        if sender != user.whatsapp_name:
+            continue
+        if message.startswith('\u200e'):
+            continue
+        if 'image omitted' in message.lower():
+            continue
+        message = message.replace('<This message was edited>', '').strip()
+        if not message:
+            continue
+        messages.append({'date': date, 'time': time, 'message': message})
+
+    if not messages:
+        raise HTTPException(status_code=400, detail="No messages found. Make sure your name matches exactly.")
+
+    # Save parsed messages
+    parsed = {'user': user.name, 'total_messages': len(messages), 'messages': messages}
+    file_path = f"{UPLOAD_DIR}/{user_id}.json"
     with open(file_path, 'w', encoding='utf-8') as f:
-        json.dump(messages, f, ensure_ascii=False, indent=2)
+        json.dump(parsed, f, ensure_ascii=False, indent=2)
+
+    # Build embeddings
+    build_embeddings(file_path, user_id)
+
     return {
-        "message": "File uploaded successfully ✅",
-        "total_messages": len(messages['messages']),
-        "file_path": file_path
+        "message": "File uploaded and embeddings built ✅",
+        "total_messages": len(messages)
     }
 
+# ─── Chat ──────────────────────────────────────────────────
 class ConversationMessage(BaseModel):
     role: str
     content: str
 
 class ChatRequest(BaseModel):
     message: str
+    token: str
     history: list[ConversationMessage] = []
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
-    # RAG - find most relevant messages
-    examples = find_similar_messages(request.message, n=20)
+async def chat(request: ChatRequest, db: Session = Depends(get_db)):
+    user_id = decode_token(request.token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # RAG - find most relevant messages for this user
+    examples = find_similar_messages(request.message, user_id=user_id, n=20)
     examples_text = "\n".join(examples)
 
-    system_prompt = f"""You are Sudhamsh, a young man texting his girlfriend.
-Here are real examples of how Sudhamsh actually texts:
+    system_prompt = f"""You are {user.name}, texting his girlfriend {user.partner_name}.
 
+Here are real examples of exactly how {user.name} texts:
 {examples_text}
 
-    
 STRICT RULES:
 - Only reply based on the conversation context
 - NEVER invent facts, events, or stories that weren't mentioned
 - Keep replies short, 1-2 sentences max like real texting
-- Use the same casual Telugu+English mix shown in the examples
+- Use the same casual style shown in the examples
 - Use emojis naturally like in the examples
 - If you don't know something, respond casually like "haha idk" or "emo"
 - DO NOT make up activities, events, or things that weren't discussed
 - Sound like a real person texting, not an AI"""
 
-    # Build full conversation history for Llama
     messages = [{'role': 'system', 'content': system_prompt}]
-    
-    # Add previous conversation
     for msg in request.history:
         messages.append({'role': msg.role, 'content': msg.content})
-    
-    # Add current message
     messages.append({'role': 'user', 'content': request.message})
 
-    response = ol.chat(
-        model='llama3.2',
-        messages=messages
-    )
-
+    response = ol.chat(model='llama3.2', messages=messages)
     return {"reply": response['message']['content']}
