@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import API_URL from '../config'
 
 interface Props {
   onAuth: (token: string, name: string, partnerName: string) => void
@@ -25,8 +26,8 @@ export default function Auth({ onAuth }: Props) {
     setError('')
 
     const url = isLogin
-      ? 'http://127.0.0.1:8000/login'
-      : 'http://127.0.0.1:8000/signup'
+    ? `${API_URL}/login`
+    : `${API_URL}/signup`
 
     const body = isLogin
       ? { email: form.email, password: form.password }
