@@ -2,6 +2,8 @@
 
 A full-stack AI platform that creates a personalized chatbot trained on your WhatsApp chat history. Upload your chats, and your digital twin learns your unique texting style, vocabulary, and personality to respond just like you.
 
+## 📄 Research Paper
+[PersonaRAG: A RAG Framework for Personal Communication Style Mimicry](paper/PersonaRAG_VirtualTwin.pdf)
 ---
 
 ##  What It Does
